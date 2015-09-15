@@ -4,9 +4,24 @@ from urllib import urlencode
 import json
 import sys
 import requests
-#import module
+import urllib
+import datetime
+from requests.auth import AuthBase
+
+from server_sent_events import iterate_server_sent_events, ServerSentEvent
 
 API_URL = "https://connect.insteon.com"
+
+class InsteonAuth(AuthBase):
+    """Attaches HTTP Basic Authentication to the given Request object."""
+    def __init__(self, client_id, access_token):
+        self.client_id = client_id
+        self.access_token = access_token
+
+    def __call__(self, r):
+        r.headers["Authentication"] = "APIKey " + self.client_id
+        r.headers["Authorization"] = "Bearer " + self.access_token
+        return r
 
 class APIError(Exception):
     """API Error Response
@@ -52,28 +67,37 @@ class Insteon(object):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         response = requests.post(API_URL + '/api/v2/oauth2/token', data=data, headers=headers)
         self.auth = response.json()
+        self.requests_auth = InsteonAuth(self.client_id, self.auth['access_token'])
 
-    def _api_get(self, url,
-                    parameters = '',
-                    content_type="application/json", 
-                ):
-        '''Perform Get Request authentication packet'''
-        headers={"Content-Type": content_type,
-                "Authentication": "APIKey " + self.client_id,
-                "Authorization": "Bearer " + self.auth['access_token']
-        }
-        if parameters != '':
-            parameter_string = ''
-            for k,v in parameters.iteritems():
-                parameter_string += '{}={}'.format(k,v)
-                parameter_string += '&'
-            url += '?' + parameter_string
-        response = requests.get(API_URL + url, headers=headers)
+    def _api_get(self, url, parameters=None, content_type="application/json"):
+        """Perform an API HTTP GET request."""
+        headers = {"Content-Type": content_type,
+                   "Authentication": "APIKey " + self.client_id,
+                   "Authorization": "Bearer " + self.auth['access_token']}
+        print "GET {url} {params}".format(url=url, params=parameters or '')
+        response = requests.get(API_URL + url, headers=headers, params=parameters)
+        print "--> {0}".format(response.text[:100])
+        if len(response.text) == 0:
+            return None
         data = response.json()
         if response.status_code >= 400:
             raise APIError(data)
         else:
             return data
+
+    def _api_get_streaming(self, url, parameters=None):
+        """Perform an API HTTP  GET request and return the raw result for streaming."""
+        print "GET {url} {params}".format(url=url, params=parameters or '')
+        response = requests.get(API_URL + url, params=parameters, auth=self.requests_auth, allow_redirects=False, stream=True)
+        if int(response.status_code / 100) == 3:
+            # Redirect - re-request the new URL
+            # Note that we can't just let requests handle redirects because it strips the authentication
+            # when redirected to a different host.
+            new_url = response.headers['location']
+            print "(REDIRECT) GET {url} {params}".format(url=new_url, params=parameters or '')
+            response = requests.get(new_url, params=parameters,
+                                    auth=self.requests_auth, allow_redirects=False, stream=True)
+        return response
 
     def _api_post(self, url,
                     data = {}, 
@@ -302,6 +326,16 @@ class House(object):
     def delete(self):
         pass
 
+    def __repr__(self):
+        return "House: " + self.HouseName
+
+    def stream(self, max_time_seconds=60*60*24):
+        end_time = datetime.datetime.now() + datetime.timedelta(seconds=max_time_seconds)
+        while datetime.datetime.now() < end_time:
+            response = self.api_iface._api_get_streaming("/api/v2/houses/{id}/stream".format(id=self.HouseID))
+            for event in iterate_server_sent_events(response.iter_lines()):
+                yield event
+
 class Device(object):
     def __init__(self, data, api_iface):
         self.api_iface = api_iface
@@ -336,6 +370,9 @@ class Device(object):
         self.device_id = data['DeviceID']
         self.device_name = data['DeviceName']
         self.properties = data
+
+    def __repr__(self):
+        return "Device: " + self.device_name
 
 class Camera(object):
     pass
